@@ -172,7 +172,7 @@ class BitbucketAPI:
                 f"Bitbucket returned an unexpected redirect (HTTP {response.status_code})."
             )
         if response.is_error:
-            raise _http_error(response)
+            raise _http_error(response, self.settings.token)
         return response
 
     async def json(
@@ -190,7 +190,7 @@ class BitbucketAPI:
             raise ToolError("Bitbucket returned invalid JSON.") from exc
 
 
-def _http_error(response: httpx.Response) -> ToolError:
+def _http_error(response: httpx.Response, secret: str | None = None) -> ToolError:
     messages: list[str] = []
     try:
         payload = response.json()
@@ -206,6 +206,8 @@ def _http_error(response: httpx.Response) -> ToolError:
         pass
 
     detail = "; ".join(messages[:3])
+    if secret:
+        detail = detail.replace(secret, "[REDACTED]")
     message = f"Bitbucket HTTP {response.status_code}"
     if detail:
         message += f": {detail[:500]}"
