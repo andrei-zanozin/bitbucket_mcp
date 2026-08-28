@@ -53,18 +53,15 @@ def _required_string(value: Any, name: str) -> str:
     return value.strip()
 
 
-def _environment_value(value: Any, name: str) -> str:
-    reference = _required_string(value, name)
-    match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", reference)
+def _value_or_environment(value: Any, name: str) -> str:
+    value = _required_string(value, name)
+    if not value.startswith("${"):
+        return value
+    match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
     if not match:
         raise ToolError(f"{name} must use ${{ENVIRONMENT_VARIABLE}} syntax.")
     variable = match.group(1)
     return _required_string(os.getenv(variable), variable)
-
-
-def _value_or_environment(value: Any, name: str) -> str:
-    value = _required_string(value, name)
-    return _environment_value(value, name) if value.startswith("${") else value
 
 
 @lru_cache(maxsize=1)
@@ -83,11 +80,9 @@ def _settings() -> Settings:
 
     base_url = _value_or_environment(config.get("base_url"), "base_url").rstrip("/")
     token = _value_or_environment(config.get("token"), "token")
-    api_prefix = _value_or_environment(
+    api_prefix = "/" + _value_or_environment(
         config.get("api_prefix", "/rest/api/1.0"), "api_prefix"
-    )
-    api_prefix = "/" + api_prefix.strip("/")
-
+    ).strip("/")
     user_slug = _value_or_environment(config.get("user_slug"), "user_slug")
 
     timeout = config.get("timeout", 30)
@@ -182,20 +177,25 @@ class BitbucketAPI:
             raise ToolError("Bitbucket returned invalid JSON.") from exc
 
 
+async def _request_json(method: str, path: str, **kwargs: Any) -> Any:
+    async with BitbucketAPI(_settings()) as api:
+        return await api.json(method, path, **kwargs)
+
+
 def _http_error(response: httpx.Response, secret: str | None = None) -> ToolError:
-    messages: list[str] = []
     try:
-        payload = response.json()
-        if isinstance(payload, dict) and isinstance(payload.get("errors"), list):
-            messages = [
-                item["message"].strip()
-                for item in payload["errors"]
-                if isinstance(item, dict)
-                and isinstance(item.get("message"), str)
-                and item["message"].strip()
-            ]
-    except ValueError:
-        pass
+        errors = response.json().get("errors", [])
+    except (AttributeError, ValueError):
+        errors = []
+    if not isinstance(errors, list):
+        errors = []
+    messages = [
+        item["message"].strip()
+        for item in errors
+        if isinstance(item, dict)
+        and isinstance(item.get("message"), str)
+        and item["message"].strip()
+    ]
 
     detail = "; ".join(messages[:3])
     if secret:
@@ -299,12 +299,14 @@ def _path_text(value: Any) -> str | None:
         return value
     if not isinstance(value, dict):
         return None
-    if isinstance(value.get("toString"), str):
-        return value["toString"]
-    if isinstance(value.get("components"), list):
-        components = [part for part in value["components"] if isinstance(part, str)]
-        if len(components) == len(value["components"]):
-            return "/".join(components)
+    text = value.get("toString")
+    if isinstance(text, str):
+        return text
+    components = value.get("components")
+    if isinstance(components, list) and all(
+        isinstance(part, str) for part in components
+    ):
+        return "/".join(components)
     parent, name = value.get("parent"), value.get("name")
     if isinstance(name, str):
         return f"{parent}/{name}" if isinstance(parent, str) and parent else name
@@ -375,21 +377,24 @@ def _is_truncated(value: Any) -> bool:
     return value is True or isinstance(value, str) and value.lower() == "true"
 
 
+def _list_field(value: Any, field: str, error: str) -> list[Any]:
+    items = value.get(field) if isinstance(value, dict) else None
+    if not isinstance(items, list):
+        raise ToolError(f"Bitbucket returned an invalid {error}.")
+    return items
+
+
 def _parse_diff(
     value: Any,
     change: dict[str, Any],
     line: int,
     side: AnchorSide,
-) -> tuple[dict[str, Any] | None, set[int], bool]:
-    if isinstance(value, dict):
-        diffs = value.get("diffs")
-        truncated = _is_truncated(value.get("truncated"))
-    elif isinstance(value, list):
+) -> tuple[dict[str, Any] | None, set[int]]:
+    if isinstance(value, list):
         diffs, truncated = value, False
     else:
-        diffs, truncated = None, False
-    if not isinstance(diffs, list):
-        raise ToolError("Bitbucket returned an invalid structured diff.")
+        diffs = _list_field(value, "diffs", "structured diff")
+        truncated = _is_truncated(value.get("truncated"))
 
     destination_path = change["path"]
     source_path = change.get("src_path")
@@ -417,23 +422,16 @@ def _parse_diff(
                 f"{destination_path} is binary and cannot receive an anchored text comment."
             )
         truncated = truncated or _is_truncated(raw_diff.get("truncated"))
-        hunks = raw_diff.get("hunks")
-        if not isinstance(hunks, list):
-            raise ToolError("Bitbucket returned an invalid diff hunk list.")
-        for hunk in hunks:
-            if not isinstance(hunk, dict) or not isinstance(hunk.get("segments"), list):
-                raise ToolError("Bitbucket returned an invalid diff hunk.")
+        for hunk in _list_field(raw_diff, "hunks", "diff hunk list"):
+            segments = _list_field(hunk, "segments", "diff hunk")
             truncated = truncated or _is_truncated(hunk.get("truncated"))
-            for segment in hunk["segments"]:
-                if not isinstance(segment, dict) or not isinstance(
-                    segment.get("lines"), list
-                ):
-                    raise ToolError("Bitbucket returned an invalid diff segment.")
+            for segment in segments:
+                lines = _list_field(segment, "lines", "diff segment")
                 truncated = truncated or _is_truncated(segment.get("truncated"))
                 line_type = str(segment.get("type", "")).upper()
                 if line_type not in allowed_types:
                     continue
-                for item in segment["lines"]:
+                for item in lines:
                     if not isinstance(item, dict):
                         raise ToolError("Bitbucket returned an invalid diff line.")
                     truncated = truncated or _is_truncated(item.get("truncated"))
@@ -448,18 +446,17 @@ def _parse_diff(
                         )
                     seen.add(number)
                     if number == line:
-                        candidates.append(
-                            _compact(
-                                diffType="EFFECTIVE",
-                                path=destination_path,
-                                srcPath=source_path
-                                if source_path != destination_path
-                                else None,
-                                line=line,
-                                lineType=line_type,
-                                fileType="TO" if side == "destination" else "FROM",
-                            )
+                        anchor = _compact(
+                            diffType="EFFECTIVE",
+                            path=destination_path,
+                            srcPath=(
+                                source_path if source_path != destination_path else None
+                            ),
+                            line=line,
+                            lineType=line_type,
+                            fileType="TO" if side == "destination" else "FROM",
                         )
+                        candidates.append(anchor)
 
     if not matched:
         raise ToolError(
@@ -470,7 +467,11 @@ def _parse_diff(
         raise ToolError(
             f"Line {line} in {destination_path} has an ambiguous diff anchor."
         )
-    return next(iter(unique.values()), None), seen, truncated
+    if truncated:
+        raise ToolError(
+            "Bitbucket truncated the structured diff; the anchor is unsafe."
+        )
+    return next(iter(unique.values()), None), seen
 
 
 async def _all_changes(api: BitbucketAPI, pr_path: str) -> list[dict[str, Any]]:
@@ -514,17 +515,15 @@ async def _structured_diff(
     change: dict[str, Any],
     context_lines: int,
 ) -> Any:
-    params: dict[str, Any] = {
-        "diffType": "EFFECTIVE",
-        "withComments": "false",
-        "contextLines": context_lines,
-    }
-    if change.get("src_path"):
-        params["srcPath"] = change["src_path"]
     return await api.json(
         "GET",
         f"{pr_path}/diff/{_encoded_file_path(change['path'])}",
-        params=params,
+        params=_compact(
+            diffType="EFFECTIVE",
+            withComments="false",
+            contextLines=context_lines,
+            srcPath=change.get("src_path"),
+        ),
     )
 
 
@@ -551,13 +550,7 @@ async def _resolve_anchor(
         raise ToolError("An added file has no source-side anchor.")
 
     payload = await _structured_diff(api, pr_path, change, INITIAL_ANCHOR_CONTEXT)
-    anchor, seen, truncated = _parse_diff(
-        payload, change, requested.line, requested.side
-    )
-    if truncated:
-        raise ToolError(
-            "Bitbucket truncated the structured diff; the anchor is unsafe."
-        )
+    anchor, seen = _parse_diff(payload, change, requested.line, requested.side)
     if anchor:
         return anchor
 
@@ -568,11 +561,7 @@ async def _resolve_anchor(
             "The requested line requires more diff context than can be fetched safely."
         )
     payload = await _structured_diff(api, pr_path, change, expanded_context)
-    anchor, _, truncated = _parse_diff(payload, change, requested.line, requested.side)
-    if truncated:
-        raise ToolError(
-            "Bitbucket truncated the structured diff; the anchor is unsafe."
-        )
+    anchor, _ = _parse_diff(payload, change, requested.line, requested.side)
     if not anchor:
         raise ToolError(
             f"Line {requested.line} has no valid {requested.side}-side diff anchor."
@@ -597,17 +586,16 @@ async def search_pull_requests(
 ) -> dict[str, Any]:
     """Search pull requests by text, including history by default."""
     text = _required_string(text, "text")
-    async with BitbucketAPI(_settings()) as api:
-        payload = await api.json(
-            "GET",
-            f"{_repo_path(project, repo)}/pull-requests",
-            params={
-                "filterText": text,
-                "state": state,
-                "start": cursor,
-                "limit": limit,
-            },
-        )
+    payload = await _request_json(
+        "GET",
+        f"{_repo_path(project, repo)}/pull-requests",
+        params={
+            "filterText": text,
+            "state": state,
+            "start": cursor,
+            "limit": limit,
+        },
+    )
     values, next_cursor = _page(payload, "pull request", cursor)
     return {
         "items": [_pull_request(value) for value in values],
@@ -620,8 +608,7 @@ async def get_pull_request(
     project: str, repo: str, pr_id: PositiveId
 ) -> dict[str, Any]:
     """Read pull request metadata, branches, description, and reviewers."""
-    async with BitbucketAPI(_settings()) as api:
-        return _pull_request(await api.json("GET", _pr_path(project, repo, pr_id)))
+    return _pull_request(await _request_json("GET", _pr_path(project, repo, pr_id)))
 
 
 @mcp.tool(structured_output=False)
@@ -633,11 +620,9 @@ async def get_pull_request_diff(
     whitespace: str | None = None,
 ) -> str:
     """Read a pull request as compact unified diff text."""
-    params: dict[str, Any] = {}
-    if context_lines is not None:
-        params["contextLines"] = context_lines
     if whitespace is not None:
-        params["whitespace"] = _required_string(whitespace, "whitespace")
+        whitespace = _required_string(whitespace, "whitespace")
+    params = _compact(contextLines=context_lines, whitespace=whitespace)
     async with BitbucketAPI(_settings()) as api:
         response = await api.request(
             "GET",
@@ -664,12 +649,11 @@ async def get_pull_request_comments(
     limit: Limit = 25,
 ) -> dict[str, Any]:
     """Read pull request discussion threads and replies."""
-    async with BitbucketAPI(_settings()) as api:
-        payload = await api.json(
-            "GET",
-            f"{_pr_path(project, repo, pr_id)}/comments",
-            params={"start": cursor, "limit": limit},
-        )
+    payload = await _request_json(
+        "GET",
+        f"{_pr_path(project, repo, pr_id)}/comments",
+        params={"start": cursor, "limit": limit},
+    )
     values, next_cursor = _page(payload, "comment", cursor)
     return {
         "comments": [_comment(value) for value in values],
@@ -705,12 +689,11 @@ async def create_pull_request(
             {"user": {"name": _required_string(reviewer, "reviewer")}}
             for reviewer in reviewers
         ]
-    async with BitbucketAPI(_settings()) as api:
-        return _pull_request(
-            await api.json(
-                "POST", f"{_repo_path(project, repo)}/pull-requests", body=body
-            )
+    return _pull_request(
+        await _request_json(
+            "POST", f"{_repo_path(project, repo)}/pull-requests", body=body
         )
+    )
 
 
 @mcp.tool()
@@ -725,9 +708,10 @@ async def add_pull_request_comment(
     """Add a general, anchored, or reply comment to a pull request."""
     if reply_to is not None and anchor is not None:
         raise ToolError("reply_to and anchor are mutually exclusive.")
-    body: dict[str, Any] = {"text": _required_string(text, "text")}
-    if reply_to is not None:
-        body["parent"] = {"id": reply_to}
+    body = _compact(
+        text=_required_string(text, "text"),
+        parent={"id": reply_to} if reply_to is not None else None,
+    )
     pr_path = _pr_path(project, repo, pr_id)
     async with BitbucketAPI(_settings()) as api:
         if anchor is not None:
