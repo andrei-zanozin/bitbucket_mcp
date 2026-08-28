@@ -1,11 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "httpx>=0.28,<1",
-#   "mcp>=2.1.1,<3",
-#   "PyYAML>=6,<7",
-# ]
-# ///
 """Minimal Bitbucket Data Center MCP server."""
 
 from __future__ import annotations
