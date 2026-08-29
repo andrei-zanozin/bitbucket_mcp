@@ -113,18 +113,18 @@ def _load_proxy_settings(value: Any) -> ProxySettings:
         parsed = httpx.URL(server)
     except httpx.InvalidURL as exc:
         raise ConfigurationError(
-            "server must resolve to an HTTPS URL without credentials, "
+            "server must resolve to an HTTP(S) URL without credentials, "
             "a query, or a fragment."
         ) from exc
     if (
-        parsed.scheme != "https"
+        parsed.scheme not in {"http", "https"}
         or not parsed.host
         or parsed.userinfo
         or parsed.query
         or parsed.fragment
     ):
         raise ConfigurationError(
-            "server must resolve to an HTTPS URL without credentials, "
+            "server must resolve to an HTTP(S) URL without credentials, "
             "a query, or a fragment."
         )
 

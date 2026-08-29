@@ -83,13 +83,13 @@ bitbucket:
   token: token
   user_slug: user
 proxy:
-  server: https://proxy.example.com:8443
+  server: http://proxy.example.com:8080
 """
         )
 
         self.assertEqual(
             settings.proxy,
-            bitbucket_mcp.ProxySettings("https://proxy.example.com:8443"),
+            bitbucket_mcp.ProxySettings("http://proxy.example.com:8080"),
         )
 
     def test_loads_authenticated_proxy_from_environment(self) -> None:
@@ -177,13 +177,13 @@ proxy:
                 "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy: {}",
                 "server must be a non-empty string",
             ),
-            "non-HTTPS proxy": (
-                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: http://proxy.example.com",
-                "server must resolve to an HTTPS URL",
+            "unsupported proxy scheme": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: socks5://proxy.example.com",
+                r"server must resolve to an HTTP\(S\) URL",
             ),
             "proxy with credentials in URL": (
                 "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: https://user:password@proxy.example.com",
-                "server must resolve to an HTTPS URL",
+                r"server must resolve to an HTTP\(S\) URL",
             ),
             "incomplete proxy authentication": (
                 "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: https://proxy.example.com\n  username: user",
@@ -271,7 +271,7 @@ class BitbucketAPITest(unittest.IsolatedAsyncioTestCase):
     async def test_configures_authenticated_proxy(self) -> None:
         client = AsyncMock()
         proxy_settings = bitbucket_mcp.ProxySettings(
-            "https://proxy.example.com:8443", "proxy-user", "proxy-password"
+            "http://proxy.example.com:8080", "proxy-user", "proxy-password"
         )
         with patch.object(bitbucket_mcp.httpx, "AsyncClient", return_value=client) as init:
             async with bitbucket_mcp.BitbucketAPI(self.settings, proxy_settings):

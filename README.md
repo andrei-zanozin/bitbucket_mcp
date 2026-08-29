@@ -47,7 +47,7 @@ bitbucket:
 such as `${BITBUCKET_API_PREFIX}`. `timeout` is measured in seconds and must be
 greater than `0` and no greater than `300`.
 
-To route Bitbucket requests through an HTTPS proxy, add a root-level `proxy`
+To route Bitbucket requests through an HTTP or HTTPS proxy, add a root-level `proxy`
 mapping:
 
 ```yaml
@@ -57,10 +57,11 @@ proxy:
   password: ${PROXY_PASSWORD}
 ```
 
-`server` is required when the `proxy` mapping is present and must use an `https://`
-URL. Proxy authentication is optional; omit both `username` and `password` for an
-anonymous proxy. If authentication is used, both settings are required. All proxy
-settings accept literal values or environment references.
+`server` is required when the `proxy` mapping is present and must use an `http://`
+or `https://` URL. This scheme describes the connection to the proxy; Bitbucket can
+still use HTTPS. Proxy authentication is optional; omit both `username` and
+`password` for an anonymous proxy. If authentication is used, both settings are
+required. All proxy settings accept literal values or environment references.
 
 ## Run
 
