@@ -272,8 +272,12 @@ class BitbucketAPI:
             raise ToolError("Bitbucket returned invalid JSON.") from exc
 
 
+def _create_api() -> BitbucketAPI:
+    return BitbucketAPI(settings.bitbucket, settings.proxy)
+
+
 async def _request_json(method: str, path: str, **kwargs: Any) -> Any:
-    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
+    async with _create_api() as api:
         return await api.json(method, path, **kwargs)
 
 
@@ -718,7 +722,7 @@ async def get_pull_request_diff(
     if whitespace is not None:
         whitespace = _required_string(whitespace, "whitespace")
     params = _compact(contextLines=context_lines, whitespace=whitespace)
-    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
+    async with _create_api() as api:
         response = await api.request(
             "GET",
             f"{_pr_path(project, repo, pr_id)}.diff",
@@ -808,7 +812,7 @@ async def add_pull_request_comment(
         parent={"id": reply_to} if reply_to is not None else None,
     )
     pr_path = _pr_path(project, repo, pr_id)
-    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
+    async with _create_api() as api:
         if anchor is not None:
             body["anchor"] = await _resolve_anchor(api, pr_path, anchor)
         return _comment(await api.json("POST", f"{pr_path}/comments", body=body))
@@ -824,7 +828,7 @@ async def set_comment_resolved(
 ) -> dict[str, Any]:
     """Resolve or unresolve a pull request discussion thread."""
     path = f"{_pr_path(project, repo, pr_id)}/comments/{comment_id}"
-    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
+    async with _create_api() as api:
         current = await api.json("GET", path)
         if not isinstance(current, dict) or not isinstance(current.get("version"), int):
             raise ToolError("Bitbucket returned a comment without a valid version.")
@@ -847,7 +851,7 @@ async def set_review_status(
 ) -> dict[str, Any]:
     """Set the authenticated user's pull request review status."""
     path = f"{_pr_path(project, repo, pr_id)}/participants/{_part(settings.bitbucket.user_slug, 'user_slug')}"
-    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
+    async with _create_api() as api:
         return _participant(await api.json("PUT", path, body={"status": status}))
 
 

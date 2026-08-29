@@ -202,6 +202,20 @@ proxy:
         with self.assertRaises(ToolError):
             bitbucket_mcp._required_string("", "text")
 
+    def test_create_api_uses_loaded_settings(self) -> None:
+        loaded_settings = bitbucket_mcp.Settings(
+            bitbucket=bitbucket_mcp.BitbucketSettings(
+                "https://example.com/rest/api/1.0", "token", "user", 30.0
+            ),
+            proxy=bitbucket_mcp.ProxySettings("https://proxy.example.com"),
+        )
+
+        with patch.object(bitbucket_mcp, "settings", loaded_settings, create=True):
+            api = bitbucket_mcp._create_api()
+
+        self.assertIs(api.settings, loaded_settings.bitbucket)
+        self.assertIs(api.proxy, loaded_settings.proxy)
+
     def test_main_validates_configuration_before_server_launch(self) -> None:
         error = bitbucket_mcp.ConfigurationError("invalid configuration")
         previous_settings = object()
