@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -75,6 +75,49 @@ bitbucket:
             ),
         )
 
+    def test_loads_anonymous_proxy(self) -> None:
+        settings = self.load_settings(
+            """
+bitbucket:
+  base_url: https://bitbucket.example.com
+  token: token
+  user_slug: user
+proxy:
+  server: https://proxy.example.com:8443
+"""
+        )
+
+        self.assertEqual(
+            settings.proxy,
+            bitbucket_mcp.ProxySettings("https://proxy.example.com:8443"),
+        )
+
+    def test_loads_authenticated_proxy_from_environment(self) -> None:
+        settings = self.load_settings(
+            """
+bitbucket:
+  base_url: https://bitbucket.example.com
+  token: token
+  user_slug: user
+proxy:
+  server: ${PROXY_SERVER}
+  username: ${PROXY_USERNAME}
+  password: ${PROXY_PASSWORD}
+""",
+            {
+                "PROXY_SERVER": "https://proxy.example.com",
+                "PROXY_USERNAME": "proxy-user",
+                "PROXY_PASSWORD": "proxy-password",
+            },
+        )
+
+        self.assertEqual(
+            settings.proxy,
+            bitbucket_mcp.ProxySettings(
+                "https://proxy.example.com", "proxy-user", "proxy-password"
+            ),
+        )
+
     def test_rejects_missing_configuration(self) -> None:
         with self.assertRaisesRegex(
             bitbucket_mcp.ConfigurationError, "Missing configuration file"
@@ -126,6 +169,26 @@ bitbucket:
                 "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\n  timeout: 0",
                 "timeout must be a number",
             ),
+            "invalid proxy mapping": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:",
+                "proxy must be a mapping",
+            ),
+            "missing proxy server": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy: {}",
+                "server must be a non-empty string",
+            ),
+            "non-HTTPS proxy": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: http://proxy.example.com",
+                "server must resolve to an HTTPS URL",
+            ),
+            "proxy with credentials in URL": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: https://user:password@proxy.example.com",
+                "server must resolve to an HTTPS URL",
+            ),
+            "incomplete proxy authentication": (
+                "bitbucket:\n  base_url: https://example.com\n  token: token\n  user_slug: user\nproxy:\n  server: https://proxy.example.com\n  username: user",
+                "username and password must be configured together",
+            ),
         }
 
         for name, (config, message) in cases.items():
@@ -175,6 +238,35 @@ bitbucket:
 
         load_settings.assert_called_once_with()
         run.assert_called_once_with()
+
+class BitbucketAPITest(unittest.IsolatedAsyncioTestCase):
+    settings = bitbucket_mcp.BitbucketSettings(
+        "https://bitbucket.example.com/rest/api/1.0", "token", "user", 30.0
+    )
+
+    async def test_disables_environment_proxy_without_proxy_settings(self) -> None:
+        client = AsyncMock()
+        with patch.object(bitbucket_mcp.httpx, "AsyncClient", return_value=client) as init:
+            async with bitbucket_mcp.BitbucketAPI(self.settings):
+                pass
+
+        self.assertIsNone(init.call_args.kwargs["proxy"])
+        self.assertFalse(init.call_args.kwargs["trust_env"])
+        client.aclose.assert_awaited_once_with()
+
+    async def test_configures_authenticated_proxy(self) -> None:
+        client = AsyncMock()
+        proxy_settings = bitbucket_mcp.ProxySettings(
+            "https://proxy.example.com:8443", "proxy-user", "proxy-password"
+        )
+        with patch.object(bitbucket_mcp.httpx, "AsyncClient", return_value=client) as init:
+            async with bitbucket_mcp.BitbucketAPI(self.settings, proxy_settings):
+                pass
+
+        proxy = init.call_args.kwargs["proxy"]
+        self.assertEqual(proxy.url, bitbucket_mcp.httpx.URL(proxy_settings.server))
+        self.assertEqual(proxy.auth, ("proxy-user", "proxy-password"))
+        self.assertFalse(init.call_args.kwargs["trust_env"])
 
 
 if __name__ == "__main__":

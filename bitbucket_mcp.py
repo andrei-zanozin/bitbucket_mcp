@@ -47,8 +47,16 @@ class BitbucketSettings:
 
 
 @dataclass(frozen=True)
+class ProxySettings:
+    server: str
+    username: str | None = None
+    password: str | None = None
+
+
+@dataclass(frozen=True)
 class Settings:
     bitbucket: BitbucketSettings
+    proxy: ProxySettings | None = None
 
 
 settings: Settings
@@ -79,6 +87,48 @@ def _value_or_environment(value: Any, name: str) -> str:
         raise ConfigurationError(f"{name} must use ${{ENVIRONMENT_VARIABLE}} syntax.")
     variable = match.group(1)
     return _required_setting(os.getenv(variable), variable)
+
+
+def _load_proxy_settings(value: Any) -> ProxySettings:
+    if not isinstance(value, dict):
+        raise ConfigurationError("proxy must be a mapping.")
+
+    server = _value_or_environment(value.get("server"), "server")
+    username_value = value.get("username")
+    password_value = value.get("password")
+    if (username_value is None) != (password_value is None):
+        raise ConfigurationError("username and password must be configured together.")
+    username = (
+        _value_or_environment(username_value, "username")
+        if username_value is not None
+        else None
+    )
+    password = (
+        _value_or_environment(password_value, "password")
+        if password_value is not None
+        else None
+    )
+
+    try:
+        parsed = httpx.URL(server)
+    except httpx.InvalidURL as exc:
+        raise ConfigurationError(
+            "server must resolve to an HTTPS URL without credentials, "
+            "a query, or a fragment."
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.host
+        or parsed.userinfo
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigurationError(
+            "server must resolve to an HTTPS URL without credentials, "
+            "a query, or a fragment."
+        )
+
+    return ProxySettings(server, username, password)
 
 
 def _load_settings() -> Settings:
@@ -140,20 +190,32 @@ def _load_settings() -> Settings:
     return Settings(
         bitbucket=BitbucketSettings(
             f"{base_url}{api_prefix}", token, user_slug, float(timeout)
-        )
+        ),
+        proxy=_load_proxy_settings(raw["proxy"]) if "proxy" in raw else None,
     )
 
 
 class BitbucketAPI:
-    def __init__(self, settings: BitbucketSettings) -> None:
+    def __init__(
+        self, settings: BitbucketSettings, proxy: ProxySettings | None = None
+    ) -> None:
         self.settings = settings
+        self.proxy = proxy
         self.client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> Self:
+        proxy = None
+        if self.proxy:
+            auth = None
+            if self.proxy.username is not None:
+                auth = (self.proxy.username, self.proxy.password or "")
+            proxy = httpx.Proxy(self.proxy.server, auth=auth)
         self.client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {self.settings.token}"},
             timeout=self.settings.timeout,
             follow_redirects=False,
+            proxy=proxy,
+            trust_env=False,
         )
         return self
 
@@ -211,7 +273,7 @@ class BitbucketAPI:
 
 
 async def _request_json(method: str, path: str, **kwargs: Any) -> Any:
-    async with BitbucketAPI(settings.bitbucket) as api:
+    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
         return await api.json(method, path, **kwargs)
 
 
@@ -656,7 +718,7 @@ async def get_pull_request_diff(
     if whitespace is not None:
         whitespace = _required_string(whitespace, "whitespace")
     params = _compact(contextLines=context_lines, whitespace=whitespace)
-    async with BitbucketAPI(settings.bitbucket) as api:
+    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
         response = await api.request(
             "GET",
             f"{_pr_path(project, repo, pr_id)}.diff",
@@ -746,7 +808,7 @@ async def add_pull_request_comment(
         parent={"id": reply_to} if reply_to is not None else None,
     )
     pr_path = _pr_path(project, repo, pr_id)
-    async with BitbucketAPI(settings.bitbucket) as api:
+    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
         if anchor is not None:
             body["anchor"] = await _resolve_anchor(api, pr_path, anchor)
         return _comment(await api.json("POST", f"{pr_path}/comments", body=body))
@@ -762,7 +824,7 @@ async def set_comment_resolved(
 ) -> dict[str, Any]:
     """Resolve or unresolve a pull request discussion thread."""
     path = f"{_pr_path(project, repo, pr_id)}/comments/{comment_id}"
-    async with BitbucketAPI(settings.bitbucket) as api:
+    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
         current = await api.json("GET", path)
         if not isinstance(current, dict) or not isinstance(current.get("version"), int):
             raise ToolError("Bitbucket returned a comment without a valid version.")
@@ -785,7 +847,7 @@ async def set_review_status(
 ) -> dict[str, Any]:
     """Set the authenticated user's pull request review status."""
     path = f"{_pr_path(project, repo, pr_id)}/participants/{_part(settings.bitbucket.user_slug, 'user_slug')}"
-    async with BitbucketAPI(settings.bitbucket) as api:
+    async with BitbucketAPI(settings.bitbucket, settings.proxy) as api:
         return _participant(await api.json("PUT", path, body={"status": status}))
 
 
