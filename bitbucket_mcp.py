@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import quote
@@ -40,11 +39,23 @@ class Anchor(BaseModel):
 
 
 @dataclass(frozen=True)
-class Settings:
+class BitbucketSettings:
     api_base: str
     token: str
     user_slug: str
     timeout: float
+
+
+@dataclass(frozen=True)
+class Settings:
+    bitbucket: BitbucketSettings
+
+
+settings: Settings
+
+
+class ConfigurationError(RuntimeError):
+    """Invalid server configuration."""
 
 
 def _required_string(value: Any, name: str) -> str:
@@ -53,66 +64,88 @@ def _required_string(value: Any, name: str) -> str:
     return value.strip()
 
 
+def _required_setting(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{name} must be a non-empty string.")
+    return value.strip()
+
+
 def _value_or_environment(value: Any, name: str) -> str:
-    value = _required_string(value, name)
+    value = _required_setting(value, name)
     if not value.startswith("${"):
         return value
     match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
     if not match:
-        raise ToolError(f"{name} must use ${{ENVIRONMENT_VARIABLE}} syntax.")
+        raise ConfigurationError(f"{name} must use ${{ENVIRONMENT_VARIABLE}} syntax.")
     variable = match.group(1)
-    return _required_string(os.getenv(variable), variable)
+    return _required_setting(os.getenv(variable), variable)
 
 
-@lru_cache(maxsize=1)
-def _settings() -> Settings:
+def _load_settings() -> Settings:
     config_path = Path(__file__).with_name("config.yml")
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError as exc:
-        raise ToolError(f"Missing configuration file: {config_path.name}.") from exc
+        raise ConfigurationError(
+            f"Missing configuration file: {config_path.name}."
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Cannot read configuration file: {config_path.name}."
+        ) from exc
     except yaml.YAMLError as exc:
-        raise ToolError("config.yml is not valid YAML.") from exc
+        raise ConfigurationError("config.yml is not valid YAML.") from exc
 
     if not isinstance(raw, dict) or not isinstance(raw.get("bitbucket"), dict):
-        raise ToolError("config.yml must contain a 'bitbucket' mapping.")
-    config = raw["bitbucket"]
+        raise ConfigurationError("config.yml must contain a 'bitbucket' mapping.")
+    bitbucket = raw["bitbucket"]
 
-    base_url = _value_or_environment(config.get("base_url"), "base_url").rstrip("/")
-    token = _value_or_environment(config.get("token"), "token")
+    base_url = _value_or_environment(bitbucket.get("base_url"), "base_url").rstrip("/")
+    token = _value_or_environment(bitbucket.get("token"), "token")
     api_prefix = "/" + _value_or_environment(
-        config.get("api_prefix", "/rest/api/1.0"), "api_prefix"
+        bitbucket.get("api_prefix", "/rest/api/1.0"), "api_prefix"
     ).strip("/")
-    user_slug = _value_or_environment(config.get("user_slug"), "user_slug")
+    user_slug = _value_or_environment(bitbucket.get("user_slug"), "user_slug")
 
-    timeout = config.get("timeout", 30)
+    timeout = bitbucket.get("timeout", 30)
     if (
         not isinstance(timeout, int | float)
         or isinstance(timeout, bool)
         or not 0 < timeout <= 300
     ):
-        raise ToolError("timeout must be a number between 0 and 300 seconds.")
+        raise ConfigurationError("timeout must be a number between 0 and 300 seconds.")
 
-    parsed = httpx.URL(base_url)
+    try:
+        parsed = httpx.URL(base_url)
+    except httpx.InvalidURL as exc:
+        raise ConfigurationError(
+            "base_url must resolve to an HTTP(S) URL without a query or fragment."
+        ) from exc
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.host
         or parsed.query
         or parsed.fragment
     ):
-        raise ToolError(
+        raise ConfigurationError(
             "base_url must resolve to an HTTP(S) URL without a query or fragment."
         )
     if parsed.path.rstrip("/").endswith("/dashboard"):
-        raise ToolError("base_url must not resolve to the Bitbucket /dashboard path.")
+        raise ConfigurationError(
+            "base_url must not resolve to the Bitbucket /dashboard path."
+        )
     if "://" in api_prefix or any(part == ".." for part in api_prefix.split("/")):
-        raise ToolError("api_prefix must be a relative URL path.")
+        raise ConfigurationError("api_prefix must be a relative URL path.")
 
-    return Settings(f"{base_url}{api_prefix}", token, user_slug, float(timeout))
+    return Settings(
+        bitbucket=BitbucketSettings(
+            f"{base_url}{api_prefix}", token, user_slug, float(timeout)
+        )
+    )
 
 
 class BitbucketAPI:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: BitbucketSettings) -> None:
         self.settings = settings
         self.client: httpx.AsyncClient | None = None
 
@@ -178,7 +211,7 @@ class BitbucketAPI:
 
 
 async def _request_json(method: str, path: str, **kwargs: Any) -> Any:
-    async with BitbucketAPI(_settings()) as api:
+    async with BitbucketAPI(settings.bitbucket) as api:
         return await api.json(method, path, **kwargs)
 
 
@@ -623,7 +656,7 @@ async def get_pull_request_diff(
     if whitespace is not None:
         whitespace = _required_string(whitespace, "whitespace")
     params = _compact(contextLines=context_lines, whitespace=whitespace)
-    async with BitbucketAPI(_settings()) as api:
+    async with BitbucketAPI(settings.bitbucket) as api:
         response = await api.request(
             "GET",
             f"{_pr_path(project, repo, pr_id)}.diff",
@@ -713,7 +746,7 @@ async def add_pull_request_comment(
         parent={"id": reply_to} if reply_to is not None else None,
     )
     pr_path = _pr_path(project, repo, pr_id)
-    async with BitbucketAPI(_settings()) as api:
+    async with BitbucketAPI(settings.bitbucket) as api:
         if anchor is not None:
             body["anchor"] = await _resolve_anchor(api, pr_path, anchor)
         return _comment(await api.json("POST", f"{pr_path}/comments", body=body))
@@ -729,7 +762,7 @@ async def set_comment_resolved(
 ) -> dict[str, Any]:
     """Resolve or unresolve a pull request discussion thread."""
     path = f"{_pr_path(project, repo, pr_id)}/comments/{comment_id}"
-    async with BitbucketAPI(_settings()) as api:
+    async with BitbucketAPI(settings.bitbucket) as api:
         current = await api.json("GET", path)
         if not isinstance(current, dict) or not isinstance(current.get("version"), int):
             raise ToolError("Bitbucket returned a comment without a valid version.")
@@ -751,11 +784,16 @@ async def set_review_status(
     status: ReviewStatus,
 ) -> dict[str, Any]:
     """Set the authenticated user's pull request review status."""
-    settings = _settings()
-    path = f"{_pr_path(project, repo, pr_id)}/participants/{_part(settings.user_slug, 'user_slug')}"
-    async with BitbucketAPI(settings) as api:
+    path = f"{_pr_path(project, repo, pr_id)}/participants/{_part(settings.bitbucket.user_slug, 'user_slug')}"
+    async with BitbucketAPI(settings.bitbucket) as api:
         return _participant(await api.json("PUT", path, body={"status": status}))
 
 
-if __name__ == "__main__":
+def main() -> None:
+    global settings
+    settings = _load_settings()
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

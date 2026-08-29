@@ -32,7 +32,8 @@ Use the Bitbucket server root URL, without `/dashboard` or a REST API path.
 `base_url`, `token`, and `user_slug` accept either literal values or
 `${ENVIRONMENT_VARIABLE}` references. Environment references are preferred,
 especially for `token`, to avoid storing credentials in `config.yml`. Set
-`user_slug` to the Bitbucket user represented by the token.
+`user_slug` to the Bitbucket user represented by the token. All three settings are
+required and validated before the MCP server starts.
 
 Add optional settings to the same `bitbucket` mapping when needed:
 
