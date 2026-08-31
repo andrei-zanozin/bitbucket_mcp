@@ -27,7 +27,7 @@ All repository-scoped tools receive `project` and `repo`. Pull request tools add
 | `search_pull_requests` | `GET /projects/{project}/repos/{repo}/pull-requests` | Search PRs using `filterText`. Pass `state`, `start`, and `limit`; default `state` to `ALL` so historical PRs are included. |
 | `get_pull_request` | `GET /projects/{project}/repos/{repo}/pull-requests/{pr_id}` | Read the title, description, state, author, reviewers, source branch, target branch, latest commits, and resource version. |
 | `get_pull_request_diff` | `GET /projects/{project}/repos/{repo}/pull-requests/{pr_id}.diff` | Read the PR as a compact raw unified diff. Support optional context-line and whitespace settings. |
-| `get_pull_request_comments` | `GET /projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments` | Read normalized discussion threads, replies, anchors, authors, resolution state, IDs, and versions. |
+| `get_pull_request_comments` | `GET /projects/{project}/repos/{repo}/pull-requests/{pr_id}/activities` | Read and normalize the complete PR-wide comment history into current discussion threads, replies, anchors, authors, resolution state, IDs, and versions. |
 | `create_pull_request` | `POST /projects/{project}/repos/{repo}/pull-requests` | Create a same-repository PR from a source branch to a target branch. |
 | `add_pull_request_comment` | `POST /projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments` | Create a general comment, an anchored comment, or a reply. |
 | `set_comment_resolved` | `GET` and `PUT /projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}` | Resolve or unresolve a discussion using its current resource version. |
@@ -81,7 +81,9 @@ The tool should identify empty, binary, or server-truncated output explicitly in
 
 ### Get Pull Request Comments
 
-Support `cursor` and `limit`. Normalize each root discussion and its nested replies into a small response containing:
+The `/comments` endpoint is file-scoped and requires a `path`, so it cannot retrieve complete PR-wide discussions. Page through `/activities` to completion, ignore non-comment activities, collapse comment lifecycle records by ID, and exclude deleted comments. Fail rather than return a partial result when an activity page or comment activity is malformed or pagination does not complete safely.
+
+Apply `cursor` and `limit` after deterministic normalization. Normalize each current root discussion and its nested replies into a small response containing:
 
 * comment ID and version
 * text and author
@@ -90,7 +92,7 @@ Support `cursor` and `limit`. Normalize each root discussion and its nested repl
 * anchor, when present
 * nested replies
 
-Preserve unknown comment fields only when they affect discussion behavior. Do not expose Bitbucket's rendered HTML alongside the source text.
+Include general, inline, resolved, and orphaned discussions. Normalize `commentAnchor`, falling back to the comment's embedded anchor, into path, source path, line, line type, file type, and diff type. Preserve unknown comment fields only when they affect discussion behavior. Do not expose Bitbucket's rendered HTML alongside the source text.
 
 ### Create Pull Request
 

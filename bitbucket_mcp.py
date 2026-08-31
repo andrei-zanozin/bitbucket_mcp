@@ -445,6 +445,131 @@ def _comment(value: Any) -> dict[str, Any]:
     )
 
 
+def _comment_id(value: Any) -> int:
+    comment_id = value.get("id") if isinstance(value, dict) else None
+    if (
+        not isinstance(comment_id, int)
+        or isinstance(comment_id, bool)
+        or comment_id <= 0
+    ):
+        raise ToolError("Bitbucket returned a comment without a valid ID.")
+    return comment_id
+
+
+def _comment_children(value: dict[str, Any]) -> list[Any]:
+    children = value.get("comments", [])
+    if not isinstance(children, list):
+        raise ToolError("Bitbucket returned an invalid comment reply list.")
+    return children
+
+
+def _activity_order(value: dict[str, Any], position: int) -> tuple[int, int, int]:
+    created_at = value.get("createdDate")
+    activity_id = value.get("id")
+    if (
+        not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or created_at < 0
+    ):
+        raise ToolError("Bitbucket returned a malformed comment activity timestamp.")
+    if (
+        not isinstance(activity_id, int)
+        or isinstance(activity_id, bool)
+        or activity_id <= 0
+    ):
+        raise ToolError("Bitbucket returned a malformed comment activity ID.")
+    return created_at, activity_id, -position
+
+
+def _current_comments(activities: list[Any]) -> list[dict[str, Any]]:
+    states: dict[int, tuple[tuple[int, int, int], dict[str, Any], int | None, Any]] = {}
+
+    def record(
+        value: Any,
+        order: tuple[int, int, int],
+        parent_id: int | None,
+        anchor: Any = None,
+    ) -> None:
+        if not isinstance(value, dict):
+            raise ToolError("Bitbucket returned an invalid comment activity payload.")
+        comment_id = _comment_id(value)
+        embedded_parent = value.get("parent")
+        if embedded_parent is not None:
+            parent_id = _comment_id(embedded_parent)
+        previous = states.get(comment_id)
+        if previous is None or order > previous[0]:
+            normalized_anchor = anchor if anchor is not None else value.get("anchor")
+            if normalized_anchor is None and previous is not None:
+                normalized_anchor = previous[3]
+            states[comment_id] = (
+                order,
+                value,
+                parent_id,
+                normalized_anchor,
+            )
+        for child in _comment_children(value):
+            record(child, order, comment_id)
+
+    deleted: dict[int, tuple[int, int, int]] = {}
+    for position, activity in enumerate(activities):
+        if not isinstance(activity, dict):
+            raise ToolError("Bitbucket returned an invalid pull request activity.")
+        if "comment" not in activity:
+            if activity.get("action") == "COMMENTED" or "commentAction" in activity:
+                raise ToolError(
+                    "Bitbucket returned a comment activity without a comment."
+                )
+            continue
+        action = activity.get("commentAction")
+        if activity.get("action") != "COMMENTED" or action not in {
+            "ADDED",
+            "DELETED",
+            "UPDATED",
+            "REPLIED",
+        }:
+            raise ToolError("Bitbucket returned a malformed comment activity.")
+        order = _activity_order(activity, position)
+        comment = activity["comment"]
+        record(comment, order, None, activity.get("commentAnchor"))
+        if action == "DELETED":
+            comment_id = _comment_id(comment)
+            if order > deleted.get(comment_id, (-1, -1, -position)):
+                deleted[comment_id] = order
+
+    current = {
+        comment_id: state
+        for comment_id, state in states.items()
+        if deleted.get(comment_id, (-1, -1, 0)) < state[0]
+    }
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for comment_id, (_, _, parent_id, _) in current.items():
+        if parent_id is None:
+            roots.append(comment_id)
+        elif parent_id in current:
+            children.setdefault(parent_id, []).append(comment_id)
+        elif parent_id not in states:
+            raise ToolError("Bitbucket returned a reply without its parent comment.")
+
+    def normalize(
+        comment_id: int, ancestors: frozenset[int] = frozenset()
+    ) -> dict[str, Any]:
+        if comment_id in ancestors:
+            raise ToolError("Bitbucket returned a cyclic comment thread.")
+        _, value, _, anchor = current[comment_id]
+        result = _comment({**value, "comments": []})
+        normalized_anchor = _comment_anchor(anchor)
+        if normalized_anchor:
+            result["anchor"] = normalized_anchor
+        result["replies"] = [
+            normalize(child_id, ancestors | {comment_id})
+            for child_id in sorted(children.get(comment_id, []))
+        ]
+        return result
+
+    return [normalize(comment_id) for comment_id in sorted(roots)]
+
+
 def _participant(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ToolError("Bitbucket returned an invalid participant.")
@@ -608,6 +733,25 @@ async def _all_changes(api: BitbucketAPI, pr_path: str) -> list[dict[str, Any]]:
     )
 
 
+async def _all_activities(pr_path: str) -> list[Any]:
+    activities: list[Any] = []
+    cursor = 0
+    for _ in range(MAX_PAGES):
+        payload = await _request_json(
+            "GET",
+            f"{pr_path}/activities",
+            params={"start": cursor, "limit": 100},
+        )
+        values, next_cursor = _page(payload, "pull request activity", cursor)
+        activities.extend(values)
+        if next_cursor is None:
+            return activities
+        cursor = next_cursor
+    raise ToolError(
+        "Bitbucket pull request activity pagination exceeded the safe page limit."
+    )
+
+
 async def _structured_diff(
     api: BitbucketAPI,
     pr_path: str,
@@ -748,15 +892,11 @@ async def get_pull_request_comments(
     limit: Limit = 25,
 ) -> dict[str, Any]:
     """Read pull request discussion threads and replies."""
-    payload = await _request_json(
-        "GET",
-        f"{_pr_path(project, repo, pr_id)}/comments",
-        params={"start": cursor, "limit": limit},
-    )
-    values, next_cursor = _page(payload, "comment", cursor)
+    comments = _current_comments(await _all_activities(_pr_path(project, repo, pr_id)))
+    end = cursor + limit
     return {
-        "comments": [_comment(value) for value in values],
-        "next_cursor": next_cursor,
+        "comments": comments[cursor:end],
+        "next_cursor": end if end < len(comments) else None,
     }
 
 
